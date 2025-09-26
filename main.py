@@ -1,28 +1,23 @@
 import os
 import threading
 import time
-import re
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from urllib.parse import urlparse
+import requests
 
 import telebot
-import feedparser
 import schedule
-import openai
-from openai import OpenAI
-from flask import Flask, request
 
 # Получение токенов из переменных окружения
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
 
-if not BOT_TOKEN or not OPENAI_API_KEY:
-    print("Ошибка: Необходимо установить переменные окружения BOT_TOKEN и OPENAI_API_KEY")
+if not BOT_TOKEN:
+    print("Ошибка: Необходимо установить переменную окружения BOT_TOKEN")
     exit(1)
 
-# Инициализация бота и OpenAI
+# Инициализация бота
 bot = telebot.TeleBot(BOT_TOKEN)
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Глобальные словари для хранения данных
 user_sources = {}      # {telegram_id: [url1, url2]}
@@ -33,6 +28,33 @@ user_states = {}       # {telegram_id: 'waiting_for_sources'}
 # Лимит бесплатных новостей
 FREE_NEWS_LIMIT = 10
 
+def parse_rss_feed(url):
+    """Парсит RSS-ленту с помощью requests и xml.etree"""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        
+        root = ET.fromstring(response.content)
+        
+        # Находим все элементы item
+        items = []
+        for item in root.findall('.//item'):
+            title = item.find('title')
+            description = item.find('description')
+            link = item.find('link')
+            
+            if title is not None and link is not None:
+                items.append({
+                    'title': title.text or '',
+                    'summary': description.text if description is not None else '',
+                    'link': link.text or ''
+                })
+        
+        return items
+    except Exception as e:
+        print(f"Ошибка при парсинге RSS: {e}")
+        return []
+
 def is_valid_rss_url(url):
     """Проверяет, является ли URL валидной RSS-лентой"""
     try:
@@ -41,48 +63,26 @@ def is_valid_rss_url(url):
             return False
         
         # Попробуем загрузить и распарсить RSS
-        feed = feedparser.parse(url)
-        return len(feed.entries) > 0
+        items = parse_rss_feed(url)
+        return len(items) > 0
     except:
         return False
 
-def process_article_with_ai(article_data):
-    """Обрабатывает статью с помощью AI и возвращает готовый пост"""
+def process_article(article_data):
+    """Обрабатывает статью и возвращает готовый пост"""
     try:
         title = article_data.get('title', 'Без заголовка')
         summary = article_data.get('summary', '')
         link = article_data.get('link', '')
         
-        # Формируем текст для обработки AI
-        article_text = f"Заголовок: {title}\n\nОписание: {summary}"
+        # Простая обработка
+        processed_text = f"📰 {title}\n\n{summary}\n\n🔗 Источник: {link}"
         
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Ты — профессиональный новостной редактор для Telegram-канала. Твоя задача — взять исходный текст новости и полностью переписать его в уникальный, готовый к публикации пост. Стиль должен быть нейтральным и информативным. В конце поста всегда добавляй ссылку на источник."
-                },
-                {
-                    "role": "user",
-                    "content": article_text
-                }
-            ],
-            max_tokens=500,
-            temperature=0.7
-        )
-        
-        ai_text = response.choices[0].message.content.strip()
-        
-        # Добавляем ссылку на источник, если её нет
-        if link and link not in ai_text:
-            ai_text += f"\n\n🔗 Источник: {link}"
-        
-        return ai_text
+        return processed_text
         
     except Exception as e:
-        print(f"Ошибка при обработке статьи AI: {e}")
-        # Возвращаем базовую версию без AI
+        print(f"Ошибка при обработке статьи: {e}")
+        # Возвращаем базовую версию
         title = article_data.get('title', 'Без заголовка')
         summary = article_data.get('summary', '')
         link = article_data.get('link', '')
@@ -101,31 +101,25 @@ def monitor_news():
         try:
             for source_url in sources:
                 # Парсим RSS-ленту
-                feed = feedparser.parse(source_url)
+                items = parse_rss_feed(source_url)
                 
-                if not feed.entries:
+                if not items:
                     continue
                 
                 # Получаем список уже отправленных статей
                 user_sent = sent_articles.get(user_id, [])
                 
                 # Проверяем новые статьи
-                for entry in feed.entries[:5]:  # Берем только последние 5 статей
-                    article_link = entry.get('link', '')
+                for item in items[:5]:  # Берем только последние 5 статей
+                    article_link = item.get('link', '')
                     
                     if article_link and article_link not in user_sent:
-                        # Обрабатываем статью с AI
-                        article_data = {
-                            'title': entry.get('title', ''),
-                            'summary': entry.get('summary', ''),
-                            'link': article_link
-                        }
-                        
-                        ai_post = process_article_with_ai(article_data)
+                        # Обрабатываем статью
+                        post = process_article(item)
                         
                         # Отправляем пост пользователю
                         try:
-                            bot.send_message(user_id, ai_post, parse_mode='HTML')
+                            bot.send_message(user_id, post, parse_mode='HTML')
                             
                             # Обновляем данные
                             if user_id not in sent_articles:
@@ -160,26 +154,6 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(60)  # Проверяем каждую минуту
 
-# Веб-сервер для Render (чтобы сервис не "засыпал")
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "�� Новостной Агент работает!"
-
-@app.route('/health')
-def health():
-    return {
-        "status": "ok", 
-        "users": len(user_sources), 
-        "timestamp": datetime.now().isoformat(),
-        "active_users": len([uid for uid in user_sources.keys() if news_count.get(uid, 0) < FREE_NEWS_LIMIT])
-    }
-
-def run_web_server():
-    """Запускает веб-сервер в отдельном потоке"""
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-
 # Команда /start
 @bot.message_handler(commands=['start'])
 def start_command(message):
@@ -193,7 +167,7 @@ def start_command(message):
     
     welcome_text = (
         "�� Добро пожаловать в 'Новостной Агент'!\n\n"
-        "Я помогу вам получать переписанные AI новости из ваших RSS-источников.\n\n"
+        "Я помогу вам получать новости из ваших RSS-источников.\n\n"
         "📋 Как начать:\n"
         "1. Пришлите мне ссылки на RSS-ленты (по одной в сообщении)\n"
         "2. Когда закончите, отправьте команду /done\n\n"
@@ -305,8 +279,8 @@ def handle_text_message(message):
     
     # Получаем название RSS-ленты
     try:
-        feed = feedparser.parse(text)
-        feed_title = feed.feed.get('title', 'RSS-лента')
+        items = parse_rss_feed(text)
+        feed_title = "RSS-лента" if items else "RSS-лента"
     except:
         feed_title = 'RSS-лента'
     
@@ -322,14 +296,9 @@ def handle_text_message(message):
 scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
 scheduler_thread.start()
 
-# Запуск веб-сервера в отдельном потоке
-web_thread = threading.Thread(target=run_web_server, daemon=True)
-web_thread.start()
-
 if __name__ == "__main__":
     print("🤖 Запуск 'Новостного Агента'...")
-    print("�� Планировщик запущен (проверка каждый час)")
-    print("🌐 Веб-сервер запущен")
+    print("📅 Планировщик запущен (проверка каждый час)")
     print("�� Бот готов к работе!")
     
     try:
